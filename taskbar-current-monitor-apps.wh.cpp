@@ -2,7 +2,7 @@
 // @id taskbar-current-monitor-apps
 // @name Taskbar Current Monitor Apps
 // @description Show running app buttons only on their monitor, with an experimental option to expose pinned taskbar items on secondary taskbars.
-// @version 1.4.1
+// @version 1.4.2
 // @author SUlTlUS + ChatGPT
 // @github https://github.com/SUlTlUS/Taskbar-Current-Monitor-Apps
 // @include explorer.exe
@@ -27,6 +27,16 @@
 所以从 v1.4 开始，这个开关会额外 hook `CTaskListWnd::IsOnPrimaryTaskband`，让副屏任务栏在 Explorer 内部尽量被当作“主任务栏”处理。这样更有可能显示固定项，同时仍保持 `MMTaskbarMode = 2` 来让运行窗口按钮只显示在所在屏幕。
 
 这是实验功能，可能随 Windows 版本变化而失效。启用或修改此开关后，请重启 `explorer.exe`，因为副屏任务栏的固定项列表通常不会在运行中完整重建。
+
+## 调试
+
+v1.4.2 起会同时输出到 Windhawk 日志和 `OutputDebugStringW`。用 DbgViewMini 查看时，请搜索前缀：
+
+```text
+[TCMA]
+```
+
+如果完全没有 `[TCMA]`，说明 mod 没有加载进 `explorer.exe`，或者 DbgViewMini 没有捕获当前用户的 Win32 调试输出。
 
 ## 如果旧版本已经把任务栏改乱了
 
@@ -56,6 +66,22 @@
 
 #include <windhawk_utils.h>
 #include <windows.h>
+
+#include <stdarg.h>
+#include <stdio.h>
+
+static void DebugLog(PCWSTR format, ...) {
+    WCHAR buffer[1024];
+    va_list args;
+    va_start(args, format);
+    _vsnwprintf_s(buffer, ARRAYSIZE(buffer), _TRUNCATE, format, args);
+    va_end(args);
+
+    WCHAR output[1200];
+    _snwprintf_s(output, ARRAYSIZE(output), _TRUNCATE, L"[TCMA] %s\r\n", buffer);
+    OutputDebugStringW(output);
+    Wh_Log(L"%s", output);
+}
 
 static constexpr const wchar_t* kExplorerAdvancedKey =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced";
@@ -136,10 +162,22 @@ static bool IsForcedValueName(PCWSTR valueName, DWORD* forcedValue) {
 }
 
 static int WINAPI CTaskListWnd_IsOnPrimaryTaskband_Hook(PVOID pThis) {
+    static int logCount = 0;
+
     if (g_settings.showPinnedOnAllTaskbars) {
+        if (logCount < 20) {
+            DebugLog(L"IsOnPrimaryTaskband hook called, forced TRUE, this=%p", pThis);
+            logCount++;
+        }
+
         // Experimental: many pinned-item code paths only run for the primary
         // taskband. Make secondary taskbars pass that check too.
         return TRUE;
+    }
+
+    if (logCount < 3) {
+        DebugLog(L"IsOnPrimaryTaskband hook called, passthrough, this=%p", pThis);
+        logCount++;
     }
 
     return CTaskListWnd_IsOnPrimaryTaskband_Original(pThis);
@@ -147,25 +185,30 @@ static int WINAPI CTaskListWnd_IsOnPrimaryTaskband_Hook(PVOID pThis) {
 
 static HMODULE GetTaskbarModuleForSymbols() {
     HMODULE module = GetModuleHandleW(L"taskbar.dll");
-    if (!module) {
-        module = LoadLibraryExW(
-            L"taskbar.dll",
-            nullptr,
-            LOAD_LIBRARY_SEARCH_SYSTEM32);
-    }
-
     if (module) {
+        DebugLog(L"taskbar.dll already loaded: %p", module);
         return module;
     }
 
-    // Windows 10 keeps the old taskbar implementation in explorer.exe.
-    return GetModuleHandleW(nullptr);
+    module = LoadLibraryExW(
+        L"taskbar.dll",
+        nullptr,
+        LOAD_LIBRARY_SEARCH_SYSTEM32);
+
+    if (module) {
+        DebugLog(L"taskbar.dll loaded by mod: %p", module);
+        return module;
+    }
+
+    HMODULE explorerModule = GetModuleHandleW(nullptr);
+    DebugLog(L"taskbar.dll not found, falling back to explorer.exe module: %p", explorerModule);
+    return explorerModule;
 }
 
 static bool HookTaskbarSymbols() {
     HMODULE module = GetTaskbarModuleForSymbols();
     if (!module) {
-        Wh_Log(L"Couldn't find taskbar module, pinned-item hook unavailable");
+        DebugLog(L"Couldn't find taskbar module, pinned-item hook unavailable");
         return false;
     }
 
@@ -178,12 +221,12 @@ static bool HookTaskbarSymbols() {
     };
 
     if (!HookSymbols(module, symbolHooks, ARRAYSIZE(symbolHooks))) {
-        Wh_Log(L"HookSymbols for CTaskListWnd::IsOnPrimaryTaskband failed");
+        DebugLog(L"HookSymbols for CTaskListWnd::IsOnPrimaryTaskband failed");
         return false;
     }
 
     g_taskbarSymbolsHooked = true;
-    Wh_Log(L"Hooked CTaskListWnd::IsOnPrimaryTaskband for pinned item mode");
+    DebugLog(L"Hooked CTaskListWnd::IsOnPrimaryTaskband for pinned item mode");
     return true;
 }
 
@@ -340,7 +383,7 @@ static bool WriteDwordToAdvancedKey(PCWSTR valueName, DWORD value) {
         &disposition);
 
     if (status != ERROR_SUCCESS) {
-        Wh_Log(L"RegCreateKeyExW failed: %ld", status);
+        DebugLog(L"RegCreateKeyExW failed: %ld", status);
         return false;
     }
 
@@ -355,7 +398,7 @@ static bool WriteDwordToAdvancedKey(PCWSTR valueName, DWORD value) {
     RegCloseKey(key);
 
     if (status != ERROR_SUCCESS) {
-        Wh_Log(L"RegSetValueExW(%s) failed: %ld", valueName, status);
+        DebugLog(L"RegSetValueExW(%s) failed: %ld", valueName, status);
         return false;
     }
 
@@ -411,7 +454,7 @@ static void ApplyTaskbarMode() {
 
         g_registryWasWritten = g_registryWasWritten || okEnabled || okMode;
 
-        Wh_Log(
+        DebugLog(
             L"ApplyTaskbarMode: MMTaskbarEnabled=%u (%s), MMTaskbarMode=%u (%s), showPinnedOnAllTaskbars=%d, taskbarSymbolsHooked=%d",
             kShowTaskbarOnAllDisplays,
             okEnabled ? L"ok" : L"failed",
@@ -420,7 +463,7 @@ static void ApplyTaskbarMode() {
             g_settings.showPinnedOnAllTaskbars,
             g_taskbarSymbolsHooked);
     } else {
-        Wh_Log(
+        DebugLog(
             L"ApplyTaskbarMode: registry write disabled, hook-only mode, MMTaskbarMode=%u, showPinnedOnAllTaskbars=%d, taskbarSymbolsHooked=%d",
             kShowButtonsOnlyWhereWindowIsOpen,
             g_settings.showPinnedOnAllTaskbars,
@@ -451,7 +494,7 @@ static void LoadSettings() {
     g_settings.writeRegistry = Wh_GetIntSetting(L"writeRegistry") != 0;
     g_settings.restoreOnUnload = Wh_GetIntSetting(L"restoreOnUnload") != 0;
 
-    Wh_Log(
+    DebugLog(
         L"Settings: showPinnedOnAllTaskbars=%d, keepEnforced=%d, writeRegistry=%d, restoreOnUnload=%d",
         g_settings.showPinnedOnAllTaskbars,
         g_settings.keepEnforced,
@@ -460,12 +503,19 @@ static void LoadSettings() {
 }
 
 BOOL Wh_ModInit() {
-    Wh_Log(L"Taskbar Current Monitor Apps init");
+    DebugLog(L"Wh_ModInit: Taskbar Current Monitor Apps init, pid=%lu", GetCurrentProcessId());
 
     LoadSettings();
 
     ReadDwordFromAdvancedKey(kValueTaskbarEnabled, &g_backupEnabled);
     ReadDwordFromAdvancedKey(kValueTaskbarMode, &g_backupMode);
+
+    DebugLog(
+        L"Backup: MMTaskbarEnabled existed=%d value=%u, MMTaskbarMode existed=%d value=%u",
+        g_backupEnabled.existed,
+        g_backupEnabled.value,
+        g_backupMode.existed,
+        g_backupMode.value);
 
     HookTaskbarSymbols();
 
@@ -475,7 +525,7 @@ BOOL Wh_ModInit() {
     }
 
     if (!advapi32) {
-        Wh_Log(L"Couldn't load advapi32.dll");
+        DebugLog(L"Couldn't load advapi32.dll");
         return FALSE;
     }
 
@@ -485,7 +535,7 @@ BOOL Wh_ModInit() {
         GetProcAddress(advapi32, "RegQueryValueExW"));
 
     if (!regGetValue || !regQueryValueEx) {
-        Wh_Log(L"Couldn't find registry APIs");
+        DebugLog(L"Couldn't find registry APIs");
         return FALSE;
     }
 
@@ -493,7 +543,7 @@ BOOL Wh_ModInit() {
             regGetValue,
             reinterpret_cast<void*>(RegGetValueW_Hook),
             reinterpret_cast<void**>(&RegGetValueW_Original))) {
-        Wh_Log(L"Wh_SetFunctionHook(RegGetValueW) failed");
+        DebugLog(L"Wh_SetFunctionHook(RegGetValueW) failed");
         return FALSE;
     }
 
@@ -501,7 +551,7 @@ BOOL Wh_ModInit() {
             regQueryValueEx,
             reinterpret_cast<void*>(RegQueryValueExW_Hook),
             reinterpret_cast<void**>(&RegQueryValueExW_Original))) {
-        Wh_Log(L"Wh_SetFunctionHook(RegQueryValueExW) failed");
+        DebugLog(L"Wh_SetFunctionHook(RegQueryValueExW) failed");
         return FALSE;
     }
 
@@ -510,16 +560,18 @@ BOOL Wh_ModInit() {
 }
 
 void Wh_ModAfterInit() {
+    DebugLog(L"Wh_ModAfterInit");
     ApplyTaskbarMode();
 }
 
 void Wh_ModSettingsChanged() {
+    DebugLog(L"Wh_ModSettingsChanged");
     LoadSettings();
     ApplyTaskbarMode();
 }
 
 void Wh_ModUninit() {
-    Wh_Log(L"Taskbar Current Monitor Apps uninit");
+    DebugLog(L"Wh_ModUninit");
 
     // Stop returning forced values before notifying Explorer, otherwise Explorer
     // can refresh while the hook still reports the modded values.
