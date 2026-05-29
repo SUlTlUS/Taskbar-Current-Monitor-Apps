@@ -2,7 +2,7 @@
 // @id taskbar-current-monitor-apps
 // @name Taskbar Current Monitor Apps
 // @description Show running app buttons only on their monitor, with diagnostics for pinned buttons on secondary taskbars.
-// @version 1.5.1
+// @version 1.5.2
 // @author SUlTlUS + ChatGPT
 // @github https://github.com/SUlTlUS/Taskbar-Current-Monitor-Apps
 // @include explorer.exe
@@ -14,14 +14,21 @@
 /*
 # Taskbar Current Monitor Apps
 
-v1.5.1 fixes Windhawk/Clang compilation by removing MSVC-only `__try / __except`.
-It keeps the old task list diagnostics and Windows 11 XAML taskbar diagnostics.
+v1.5.2 adds a deeper Windows 11 UI-layer diagnostic hook.
 
-Search logs for `[TCMA]` and especially:
+The old task-list logs showed that pinned task groups already exist on both task lists,
+so the problem is likely in the XAML taskbar rendering layer. This version hooks:
 
-- `Pinned check:`
-- `TaskListButton DisplayName:`
-- `Made TaskListButton visible:`
+- `Taskbar.TaskListButton::DisplayName`
+- `Taskbar.TaskListButton::UpdateVisualStates`
+
+It also actively sends `WM_SETTINGCHANGE` to taskbar windows after init/settings changes.
+
+Search logs for `[TCMA]`, especially:
+
+- `TaskListButton UpdateVisualStates`
+- `TaskListButton DisplayName`
+- `Made TaskListButton visible`
 
 When `showPinnedOnAllTaskbars` is enabled, the mod forces safe runtime-only mode:
 
@@ -97,6 +104,7 @@ using CTaskListWnd__GetTBGroupFromGroup_t=PVOID(WINAPI*)(PVOID,PVOID,int*);
 using CTaskListWnd__CreateTBGroup_t=PVOID(WINAPI*)(PVOID,PVOID,int);
 using CTaskListWnd__TaskCreated_t=LONG_PTR(WINAPI*)(PVOID,PVOID,PVOID,int);
 using TaskListButton_DisplayName_t=void(WINAPI*)(void*,winrt::hstring);
+using TaskListButton_UpdateVisualStates_t=void(WINAPI*)(void*);
 
 static RegGetValueW_t RegGetValueW_Original;
 static RegQueryValueExW_t RegQueryValueExW_Original;
@@ -106,6 +114,7 @@ static CTaskListWnd__GetTBGroupFromGroup_t CTaskListWnd__GetTBGroupFromGroup_Ori
 static CTaskListWnd__CreateTBGroup_t CTaskListWnd__CreateTBGroup_Original;
 static CTaskListWnd__TaskCreated_t CTaskListWnd__TaskCreated_Original;
 static TaskListButton_DisplayName_t TaskListButton_DisplayName_Original;
+static TaskListButton_UpdateVisualStates_t TaskListButton_UpdateVisualStates_Original;
 
 static bool WideEquals(PCWSTR a,PCWSTR b){return a&&b&&_wcsicmp(a,b)==0;}
 
@@ -113,6 +122,28 @@ static bool IsForcedValueName(PCWSTR valueName,DWORD* forcedValue){
     if(WideEquals(valueName,kValueTaskbarEnabled)){*forcedValue=kShowTaskbarOnAllDisplays;return true;}
     if(WideEquals(valueName,kValueTaskbarMode)){*forcedValue=kShowButtonsOnlyWhereWindowIsOpen;return true;}
     return false;
+}
+
+static void TryMakeTaskListButtonVisible(void* pThis, PCWSTR reason, PCWSTR name) {
+    if(!g_settings.showPinnedOnAllTaskbars){return;}
+    try{
+        void* unkPtr=(void**)pThis+3;
+        winrt::Windows::Foundation::IUnknown unk;
+        winrt::copy_from_abi(unk,unkPtr);
+        FrameworkElement element=unk.try_as<FrameworkElement>();
+        if(element){
+            element.Visibility(Visibility::Visible);
+            element.Opacity(1.0);
+            static int v=0;
+            if(v<300){
+                DebugLog(L"Made TaskListButton visible: reason=%s, this=%p, name=%s",reason,pThis,name?name:L"");
+                v++;
+            }
+        }
+    }catch(...){
+        static int e=0;
+        if(e<30){DebugLog(L"TaskListButton visibility tweak exception: reason=%s, this=%p",reason,pThis);e++;}
+    }
 }
 
 static int WINAPI CTaskListWnd_IsOnPrimaryTaskband_Hook(PVOID pThis){
@@ -147,21 +178,33 @@ static void WINAPI TaskListButton_DisplayName_Hook(void* pThis,winrt::hstring na
     TaskListButton_DisplayName_Original(pThis,name);
     static int n=0;
     if(n<300){DebugLog(L"TaskListButton DisplayName: this=%p, name=%s",pThis,name.c_str());n++;}
-    if(g_settings.showPinnedOnAllTaskbars){
-        try{
-            void* unkPtr=(void**)pThis+3;
-            winrt::Windows::Foundation::IUnknown unk;
-            winrt::copy_from_abi(unk,unkPtr);
-            FrameworkElement element=unk.try_as<FrameworkElement>();
-            if(element){
-                element.Visibility(Visibility::Visible);
-                element.Opacity(1.0);
-                static int v=0;if(v<200){DebugLog(L"Made TaskListButton visible: this=%p, name=%s",pThis,name.c_str());v++;}
-            }
-        }catch(...){
-            static int e=0;if(e<20){DebugLog(L"TaskListButton visibility tweak exception: this=%p",pThis);e++;}
-        }
+    TryMakeTaskListButtonVisible(pThis,L"DisplayName",name.c_str());
+}
+
+static void WINAPI TaskListButton_UpdateVisualStates_Hook(void* pThis){
+    TaskListButton_UpdateVisualStates_Original(pThis);
+    static int n=0;
+    if(n<500){DebugLog(L"TaskListButton UpdateVisualStates: this=%p",pThis);n++;}
+    TryMakeTaskListButtonVisible(pThis,L"UpdateVisualStates",nullptr);
+}
+
+static BOOL CALLBACK RefreshTaskbarEnumProc(HWND hWnd, LPARAM){
+    DWORD pid=0;
+    GetWindowThreadProcessId(hWnd,&pid);
+    if(pid!=GetCurrentProcessId()){return TRUE;}
+    WCHAR cls[64]{};
+    if(!GetClassNameW(hWnd,cls,ARRAYSIZE(cls))){return TRUE;}
+    if(_wcsicmp(cls,L"Shell_TrayWnd")==0||_wcsicmp(cls,L"Shell_SecondaryTrayWnd")==0){
+        DebugLog(L"RefreshTaskbar: sending WM_SETTINGCHANGE to %s hwnd=%p",cls,hWnd);
+        SendMessageW(hWnd,WM_SETTINGCHANGE,0,0);
     }
+    return TRUE;
+}
+
+static void RefreshTaskbarWindows(){
+    EnumWindows(RefreshTaskbarEnumProc,0);
+    Sleep(250);
+    EnumWindows(RefreshTaskbarEnumProc,0);
 }
 
 static bool GetTaskbarViewDllPath(WCHAR path[MAX_PATH]){
@@ -179,9 +222,10 @@ static bool HookTaskbarViewSymbols(){
     if(!module){DebugLog(L"Load taskbar view dll failed: %s",g_taskbarViewDllPath);return false;}
     WindhawkUtils::SYMBOL_HOOK hooks[]={
         {{LR"(public: void __cdecl winrt::Taskbar::implementation::TaskListButton::DisplayName(struct winrt::hstring))",LR"(public: void __cdecl winrt::Taskbar::implementation::TaskListButton::DisplayName(struct winrt::hstring) __ptr64)"},&TaskListButton_DisplayName_Original,TaskListButton_DisplayName_Hook,true},
+        {{LR"(private: void __cdecl winrt::Taskbar::implementation::TaskListButton::UpdateVisualStates(void))",LR"(private: void __cdecl winrt::Taskbar::implementation::TaskListButton::UpdateVisualStates(void) __ptr64)"},&TaskListButton_UpdateVisualStates_Original,TaskListButton_UpdateVisualStates_Hook,true},
     };
     if(!HookSymbols(module,hooks,ARRAYSIZE(hooks))){DebugLog(L"Hook Taskbar.View TaskListButton symbols failed");return false;}
-    g_taskbarViewHooked=true;DebugLog(L"Hooked Taskbar.View symbols: module=%p path=%s DisplayName=%p",module,g_taskbarViewDllPath,TaskListButton_DisplayName_Original);return true;
+    g_taskbarViewHooked=true;DebugLog(L"Hooked Taskbar.View symbols: module=%p path=%s DisplayName=%p UpdateVisualStates=%p",module,g_taskbarViewDllPath,TaskListButton_DisplayName_Original,TaskListButton_UpdateVisualStates_Original);return true;
 }
 
 static HMODULE GetTaskbarModuleForSymbols(){
@@ -236,6 +280,6 @@ BOOL Wh_ModInit(){
     ApplyTaskbarMode();return TRUE;
 }
 
-void Wh_ModAfterInit(){DebugLog(L"Wh_ModAfterInit");ApplyTaskbarMode();}
-void Wh_ModSettingsChanged(){DebugLog(L"Wh_ModSettingsChanged");LoadSettings();ApplyTaskbarMode();}
-void Wh_ModUninit(){DebugLog(L"Wh_ModUninit");g_settings.keepEnforced=false;g_settings.showPinnedOnAllTaskbars=false;if(g_settings.restoreOnUnload&&g_registryWasWritten){RestoreBackupValue(kValueTaskbarEnabled,g_backupEnabled);RestoreBackupValue(kValueTaskbarMode,g_backupMode);}NotifyExplorerSettingsChanged();}
+void Wh_ModAfterInit(){DebugLog(L"Wh_ModAfterInit");ApplyTaskbarMode();RefreshTaskbarWindows();}
+void Wh_ModSettingsChanged(){DebugLog(L"Wh_ModSettingsChanged");LoadSettings();ApplyTaskbarMode();RefreshTaskbarWindows();}
+void Wh_ModUninit(){DebugLog(L"Wh_ModUninit");g_settings.keepEnforced=false;g_settings.showPinnedOnAllTaskbars=false;if(g_settings.restoreOnUnload&&g_registryWasWritten){RestoreBackupValue(kValueTaskbarEnabled,g_backupEnabled);RestoreBackupValue(kValueTaskbarMode,g_backupMode);}NotifyExplorerSettingsChanged();RefreshTaskbarWindows();}
