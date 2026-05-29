@@ -2,7 +2,7 @@
 // @id taskbar-current-monitor-apps
 // @name Taskbar Current Monitor Apps
 // @description Keep pinned taskbar items visible on every taskbar, while running app buttons are shown only on the monitor that owns the window.
-// @version 1.1
+// @version 1.2
 // @author SUlTlUS + ChatGPT
 // @github https://github.com/SUlTlUS/Taskbar-Current-Monitor-Apps
 // @include explorer.exe
@@ -18,21 +18,23 @@
 
 - 不过滤任务栏固定项目，固定项目继续由 Explorer 原生逻辑显示在所有任务栏上。
 - 运行中的窗口按钮只显示在窗口所在显示器的任务栏上。
-- 自动打开“在所有显示器上显示任务栏”。
-- 关闭 / 卸载 mod 时默认恢复启用前的任务栏注册表状态。
+- 默认不持久写入注册表，关闭 mod 后会让 Explorer 重新读取真实设置。
 
 ## 实现方式
 
-插件不会枚举并删除任务栏按钮，也不会硬改固定项目列表。它只强制 Explorer 使用 Windows 自带的多显示器任务栏模式：
+插件不会枚举并删除任务栏按钮，也不会硬改固定项目列表。它只在 Explorer 读取多显示器任务栏设置时临时返回：
 
 - `MMTaskbarEnabled = 1`
 - `MMTaskbarMode = 2`
 
-这样可以避免误伤固定项目。固定项目是否显示在所有任务栏，由 Explorer 自己维护；mod 只影响运行窗口按钮的多显示器分配。
+这样可以避免误伤固定项目，也避免关闭 mod 后任务栏状态回不去。
 
-## 注意
+## 如果旧版本已经把任务栏改乱了
 
-如果首次启用、关闭或修改设置后没有立刻刷新，请重启 `explorer.exe` 或注销重登一次。Windows 任务栏有时会缓存多显示器按钮布局。
+先关闭这个 mod，然后运行仓库里的脚本：
+
+- `scripts/restore-all-taskbars.cmd`：恢复为所有任务栏显示所有运行窗口按钮。
+- `scripts/restore-main-taskbar-only.cmd`：恢复为只显示主任务栏。
 */
 // ==/WindhawkModReadme==
 
@@ -41,12 +43,12 @@
 - keepEnforced: true
   $name: Keep taskbar mode enforced
   $description: Keep returning the per-monitor taskbar mode when Explorer reads the taskbar registry values.
-- writeRegistry: true
+- writeRegistry: false
   $name: Also write registry values
-  $description: Write the current user's Explorer taskbar settings so the behavior survives Explorer restart while the mod is enabled.
+  $description: Optional legacy mode. Writes Explorer taskbar settings to the registry while enabled. Keep this off if you want disabling the mod to restore automatically.
 - restoreOnUnload: true
-  $name: Restore taskbar state on unload
-  $description: Restore the registry values captured when the mod was loaded after disabling or unloading the mod.
+  $name: Restore registry values on unload if registry was written
+  $description: Only used when writeRegistry is enabled. Restores the registry values captured when the mod was loaded.
 */
 // ==/WindhawkModSettings==
 
@@ -72,7 +74,7 @@ static constexpr DWORD kShowButtonsOnlyWhereWindowIsOpen = 2;
 
 struct Settings {
     bool keepEnforced = true;
-    bool writeRegistry = true;
+    bool writeRegistry = false;
     bool restoreOnUnload = true;
 };
 
@@ -85,6 +87,7 @@ struct BackupValue {
 static Settings g_settings;
 static BackupValue g_backupEnabled;
 static BackupValue g_backupMode;
+static bool g_registryWasWritten = false;
 
 using RegGetValueW_t = LSTATUS(WINAPI*)(
     HKEY hkey,
@@ -337,25 +340,29 @@ static void NotifyExplorerSettingsChanged() {
 }
 
 static void ApplyTaskbarMode() {
-    if (!g_settings.writeRegistry) {
-        return;
+    if (g_settings.writeRegistry) {
+        bool okEnabled = WriteDwordToAdvancedKey(
+            kValueTaskbarEnabled,
+            kShowTaskbarOnAllDisplays);
+
+        bool okMode = WriteDwordToAdvancedKey(
+            kValueTaskbarMode,
+            kShowButtonsOnlyWhereWindowIsOpen);
+
+        g_registryWasWritten = g_registryWasWritten || okEnabled || okMode;
+
+        Wh_Log(
+            L"ApplyTaskbarMode: MMTaskbarEnabled=%u (%s), MMTaskbarMode=%u (%s)",
+            kShowTaskbarOnAllDisplays,
+            okEnabled ? L"ok" : L"failed",
+            kShowButtonsOnlyWhereWindowIsOpen,
+            okMode ? L"ok" : L"failed");
+    } else {
+        Wh_Log(L"ApplyTaskbarMode: registry write disabled, using hook-only mode");
     }
 
-    bool okEnabled = WriteDwordToAdvancedKey(
-        kValueTaskbarEnabled,
-        kShowTaskbarOnAllDisplays);
-
-    bool okMode = WriteDwordToAdvancedKey(
-        kValueTaskbarMode,
-        kShowButtonsOnlyWhereWindowIsOpen);
-
-    Wh_Log(
-        L"ApplyTaskbarMode: MMTaskbarEnabled=%u (%s), MMTaskbarMode=%u (%s)",
-        kShowTaskbarOnAllDisplays,
-        okEnabled ? L"ok" : L"failed",
-        kShowButtonsOnlyWhereWindowIsOpen,
-        okMode ? L"ok" : L"failed");
-
+    // Even in hook-only mode, Explorer needs a settings notification so it reads
+    // the values again while this mod's registry hook is active.
     NotifyExplorerSettingsChanged();
 }
 
@@ -443,13 +450,16 @@ void Wh_ModSettingsChanged() {
 void Wh_ModUninit() {
     Wh_Log(L"Taskbar Current Monitor Apps uninit");
 
-    if (g_settings.restoreOnUnload) {
-        // Stop returning forced values before notifying Explorer, otherwise
-        // Explorer can refresh while the hook still reports the modded values.
-        g_settings.keepEnforced = false;
+    // Stop returning forced values before notifying Explorer, otherwise Explorer
+    // can refresh while the hook still reports the modded values.
+    g_settings.keepEnforced = false;
 
+    if (g_settings.restoreOnUnload && g_registryWasWritten) {
         RestoreBackupValue(kValueTaskbarEnabled, g_backupEnabled);
         RestoreBackupValue(kValueTaskbarMode, g_backupMode);
-        NotifyExplorerSettingsChanged();
     }
+
+    // Always notify Explorer on unload. In the default hook-only mode this is the
+    // actual restore path: Explorer will read the real registry values again.
+    NotifyExplorerSettingsChanged();
 }
