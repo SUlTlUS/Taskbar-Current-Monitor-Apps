@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id taskbar-current-monitor-apps
 // @name Taskbar Current Monitor Apps
-// @description Keep pinned taskbar items visible on every taskbar, while running app buttons are shown only on the monitor that owns the window.
-// @version 1.2
+// @description Toggle whether pinned taskbar items are shown on every taskbar, and optionally keep running app buttons scoped to their monitor.
+// @version 1.3
 // @author SUlTlUS + ChatGPT
 // @github https://github.com/SUlTlUS/Taskbar-Current-Monitor-Apps
 // @include explorer.exe
@@ -16,18 +16,16 @@
 
 这个 Windhawk 插件用于 Windows 多显示器任务栏：
 
-- 不过滤任务栏固定项目，固定项目继续由 Explorer 原生逻辑显示在所有任务栏上。
-- 运行中的窗口按钮只显示在窗口所在显示器的任务栏上。
+- 默认模式：运行中的窗口按钮只显示在窗口所在显示器的任务栏上。
+- 新增开关：`showPinnedOnAllTaskbars`，用于切换固定项是否尽量显示在所有任务栏。
 - 默认不持久写入注册表，关闭 mod 后会让 Explorer 重新读取真实设置。
 
-## 实现方式
+## 固定项开关说明
 
-插件不会枚举并删除任务栏按钮，也不会硬改固定项目列表。它只在 Explorer 读取多显示器任务栏设置时临时返回：
+Windows 原生的多显示器任务栏设置没有稳定公开的“只让固定项显示在所有任务栏，但运行窗口仍只显示在所在屏幕”的独立开关。因此本 mod 提供两个安全模式：
 
-- `MMTaskbarEnabled = 1`
-- `MMTaskbarMode = 2`
-
-这样可以避免误伤固定项目，也避免关闭 mod 后任务栏状态回不去。
+- `showPinnedOnAllTaskbars = false`：强制 `MMTaskbarMode = 2`，运行窗口按钮只显示在窗口所在显示器。固定项是否出现在副屏由 Explorer 当前版本决定。
+- `showPinnedOnAllTaskbars = true`：强制 `MMTaskbarMode = 0`，Explorer 原生所有任务栏模式。固定项更容易在所有任务栏显示，但运行窗口按钮也可能被 Windows 一起显示到所有任务栏。
 
 ## 如果旧版本已经把任务栏改乱了
 
@@ -40,9 +38,12 @@
 
 // ==WindhawkModSettings==
 /*
+- showPinnedOnAllTaskbars: false
+  $name: Show pinned items on all taskbars
+  $description: Uses Windows native all-taskbars mode. This can make pinned items appear on all taskbars, but Windows may also show running app buttons on all taskbars.
 - keepEnforced: true
   $name: Keep taskbar mode enforced
-  $description: Keep returning the per-monitor taskbar mode when Explorer reads the taskbar registry values.
+  $description: Keep returning the selected taskbar mode when Explorer reads the taskbar registry values.
 - writeRegistry: false
   $name: Also write registry values
   $description: Optional legacy mode. Writes Explorer taskbar settings to the registry while enabled. Keep this off if you want disabling the mod to restore automatically.
@@ -66,13 +67,15 @@ static constexpr const wchar_t* kValueTaskbarMode = L"MMTaskbarMode";
 //   MMTaskbarMode = 1: show running buttons on the main taskbar and where the window is open.
 //   MMTaskbarMode = 2: show running buttons only where the window is open.
 //
-// Pinned taskbar items are deliberately not filtered by this mod. They are not
-// enumerated or removed here; Explorer keeps rendering them with its normal
-// pinned-item logic, which avoids destroying the user's pinned taskbar layout.
+// Pinned taskbar items are deliberately not enumerated or removed by this mod.
+// The setting below switches between Windows' native taskbar modes instead of
+// rewriting Explorer's internal pinned-item lists.
 static constexpr DWORD kShowTaskbarOnAllDisplays = 1;
+static constexpr DWORD kShowButtonsOnAllTaskbars = 0;
 static constexpr DWORD kShowButtonsOnlyWhereWindowIsOpen = 2;
 
 struct Settings {
+    bool showPinnedOnAllTaskbars = false;
     bool keepEnforced = true;
     bool writeRegistry = false;
     bool restoreOnUnload = true;
@@ -113,6 +116,12 @@ static bool WideEquals(PCWSTR a, PCWSTR b) {
     return a && b && _wcsicmp(a, b) == 0;
 }
 
+static DWORD GetForcedTaskbarMode() {
+    return g_settings.showPinnedOnAllTaskbars
+        ? kShowButtonsOnAllTaskbars
+        : kShowButtonsOnlyWhereWindowIsOpen;
+}
+
 static bool IsForcedValueName(PCWSTR valueName, DWORD* forcedValue) {
     if (WideEquals(valueName, kValueTaskbarEnabled)) {
         *forcedValue = kShowTaskbarOnAllDisplays;
@@ -120,7 +129,7 @@ static bool IsForcedValueName(PCWSTR valueName, DWORD* forcedValue) {
     }
 
     if (WideEquals(valueName, kValueTaskbarMode)) {
-        *forcedValue = kShowButtonsOnlyWhereWindowIsOpen;
+        *forcedValue = GetForcedTaskbarMode();
         return true;
     }
 
@@ -340,6 +349,8 @@ static void NotifyExplorerSettingsChanged() {
 }
 
 static void ApplyTaskbarMode() {
+    const DWORD forcedMode = GetForcedTaskbarMode();
+
     if (g_settings.writeRegistry) {
         bool okEnabled = WriteDwordToAdvancedKey(
             kValueTaskbarEnabled,
@@ -347,18 +358,22 @@ static void ApplyTaskbarMode() {
 
         bool okMode = WriteDwordToAdvancedKey(
             kValueTaskbarMode,
-            kShowButtonsOnlyWhereWindowIsOpen);
+            forcedMode);
 
         g_registryWasWritten = g_registryWasWritten || okEnabled || okMode;
 
         Wh_Log(
-            L"ApplyTaskbarMode: MMTaskbarEnabled=%u (%s), MMTaskbarMode=%u (%s)",
+            L"ApplyTaskbarMode: MMTaskbarEnabled=%u (%s), MMTaskbarMode=%u (%s), showPinnedOnAllTaskbars=%d",
             kShowTaskbarOnAllDisplays,
             okEnabled ? L"ok" : L"failed",
-            kShowButtonsOnlyWhereWindowIsOpen,
-            okMode ? L"ok" : L"failed");
+            forcedMode,
+            okMode ? L"ok" : L"failed",
+            g_settings.showPinnedOnAllTaskbars);
     } else {
-        Wh_Log(L"ApplyTaskbarMode: registry write disabled, using hook-only mode");
+        Wh_Log(
+            L"ApplyTaskbarMode: registry write disabled, hook-only mode, MMTaskbarMode=%u, showPinnedOnAllTaskbars=%d",
+            forcedMode,
+            g_settings.showPinnedOnAllTaskbars);
     }
 
     // Even in hook-only mode, Explorer needs a settings notification so it reads
@@ -379,12 +394,15 @@ static void RestoreBackupValue(PCWSTR valueName, const BackupValue& backup) {
 }
 
 static void LoadSettings() {
+    g_settings.showPinnedOnAllTaskbars =
+        Wh_GetIntSetting(L"showPinnedOnAllTaskbars") != 0;
     g_settings.keepEnforced = Wh_GetIntSetting(L"keepEnforced") != 0;
     g_settings.writeRegistry = Wh_GetIntSetting(L"writeRegistry") != 0;
     g_settings.restoreOnUnload = Wh_GetIntSetting(L"restoreOnUnload") != 0;
 
     Wh_Log(
-        L"Settings: keepEnforced=%d, writeRegistry=%d, restoreOnUnload=%d",
+        L"Settings: showPinnedOnAllTaskbars=%d, keepEnforced=%d, writeRegistry=%d, restoreOnUnload=%d",
+        g_settings.showPinnedOnAllTaskbars,
         g_settings.keepEnforced,
         g_settings.writeRegistry,
         g_settings.restoreOnUnload);
