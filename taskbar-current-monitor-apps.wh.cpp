@@ -2,7 +2,7 @@
 // @id taskbar-current-monitor-apps
 // @name Taskbar Current Monitor Apps
 // @description Multi-monitor taskbar experiment: show pinned items on all taskbars and diagnose per-monitor running-window filtering.
-// @version 1.6
+// @version 1.6.1
 // @author SUlTlUS + ChatGPT
 // @github https://github.com/SUlTlUS/Taskbar-Current-Monitor-Apps
 // @include explorer.exe
@@ -14,22 +14,25 @@
 /*
 # Taskbar Current Monitor Apps
 
-v1.6 changes direction after the logs showed this:
+v1.6.1 keeps the v1.6 diagnostic hybrid mode and adds registry-read diagnostics.
 
-- the old taskbar layer creates pinned task groups on both task lists;
-- Taskbar.View symbols are resolved;
-- Taskbar.View button visual methods don't run after the hook;
-- pinned buttons still don't show with `MMTaskbarMode = 2`.
+Previous logs showed:
 
-So v1.6 uses a diagnostic hybrid mode:
+- the mod is loaded;
+- `showPinnedOnAllTaskbars = true` forces `forcedMode = 0` internally;
+- old taskbar pinned groups exist on both task lists.
 
-- `showPinnedOnAllTaskbars = false` => force `MMTaskbarMode = 2`.
-- `showPinnedOnAllTaskbars = true`  => force `MMTaskbarMode = 0` at runtime only.
+The missing piece is whether Explorer actually re-reads `MMTaskbarMode` after the
+hook is active. v1.6.1 logs every forced registry read, limited to avoid spam.
 
-The goal is to confirm whether Windows 11's XAML taskbar will render pinned items on
-secondary taskbars when it sees native "all taskbars" mode. If pinned items appear,
-the next step is to add a separate running-window filter to hide running apps from
-non-owning monitors.
+Expected log when the hook is working:
+
+```text
+[TCMA] Forced registry read: api=... value=MMTaskbarMode forced=0
+```
+
+If you see `forcedMode=0` but no forced registry-read lines, Explorer hasn't re-read
+that setting in the current session. Restart `explorer.exe` after enabling the mod.
 
 When `showPinnedOnAllTaskbars` is enabled, the mod forces:
 
@@ -37,10 +40,6 @@ When `showPinnedOnAllTaskbars` is enabled, the mod forces:
 keepEnforced = true
 writeRegistry = false
 ```
-
-so it won't write the test mode permanently to the registry.
-
-Search logs for `[TCMA]` and `forcedMode=0`.
 */
 // ==/WindhawkModReadme==
 
@@ -140,6 +139,21 @@ static bool IsForcedValueName(PCWSTR valueName, DWORD* forcedValue) {
     }
 
     return false;
+}
+
+static void LogForcedRegistryRead(PCWSTR apiName, PCWSTR valueName, DWORD forcedValue) {
+    static int logCount = 0;
+    if (logCount < 100) {
+        DebugLog(
+            L"Forced registry read: api=%s value=%s forced=%u pinned=%d keep=%d write=%d",
+            apiName,
+            valueName ? valueName : L"(null)",
+            forcedValue,
+            g_settings.showPinnedOnAllTaskbars,
+            g_settings.keepEnforced,
+            g_settings.writeRegistry);
+        logCount++;
+    }
 }
 
 static int WINAPI CTaskListWnd_IsOnPrimaryTaskband_Hook(PVOID pThis) {
@@ -255,6 +269,8 @@ static bool HookTaskbarSymbols() {
 }
 
 static LSTATUS ReturnForcedDword(
+    PCWSTR apiName,
+    PCWSTR valueName,
     DWORD forcedValue,
     DWORD requestedFlags,
     LPDWORD typeOut,
@@ -267,6 +283,8 @@ static LSTATUS ReturnForcedDword(
     if (typeFilter && !(typeFilter & RRF_RT_REG_DWORD_CONST)) {
         return ERROR_FILE_NOT_FOUND;
     }
+
+    LogForcedRegistryRead(apiName, valueName, forcedValue);
 
     if (typeOut) {
         *typeOut = REG_DWORD;
@@ -304,7 +322,7 @@ static LSTATUS WINAPI RegGetValueW_Hook(
     if (g_settings.keepEnforced) {
         DWORD forcedValue = 0;
         if (IsForcedValueName(lpValue, &forcedValue)) {
-            return ReturnForcedDword(forcedValue, dwFlags, pdwType, pvData, pcbData);
+            return ReturnForcedDword(L"RegGetValueW", lpValue, forcedValue, dwFlags, pdwType, pvData, pcbData);
         }
     }
 
@@ -321,7 +339,7 @@ static LSTATUS WINAPI RegQueryValueExW_Hook(
     if (g_settings.keepEnforced) {
         DWORD forcedValue = 0;
         if (IsForcedValueName(lpValueName, &forcedValue)) {
-            return ReturnForcedDword(forcedValue, 0, lpType, lpData, lpcbData);
+            return ReturnForcedDword(L"RegQueryValueExW", lpValueName, forcedValue, 0, lpType, lpData, lpcbData);
         }
     }
 
@@ -431,6 +449,34 @@ static void NotifyExplorerSettingsChanged() {
         &result);
 }
 
+static BOOL CALLBACK RefreshTaskbarEnumProc(HWND hWnd, LPARAM) {
+    DWORD pid = 0;
+    GetWindowThreadProcessId(hWnd, &pid);
+    if (pid != GetCurrentProcessId()) {
+        return TRUE;
+    }
+
+    WCHAR className[64]{};
+    if (!GetClassNameW(hWnd, className, ARRAYSIZE(className))) {
+        return TRUE;
+    }
+
+    if (_wcsicmp(className, L"Shell_TrayWnd") == 0 ||
+        _wcsicmp(className, L"Shell_SecondaryTrayWnd") == 0) {
+        DebugLog(L"RefreshTaskbar: sending WM_SETTINGCHANGE to %s hwnd=%p", className, hWnd);
+        SendMessageW(hWnd, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(L"TraySettings"));
+        PostMessageW(hWnd, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(L"TraySettings"));
+    }
+
+    return TRUE;
+}
+
+static void RefreshTaskbarWindows() {
+    EnumWindows(RefreshTaskbarEnumProc, 0);
+    Sleep(250);
+    EnumWindows(RefreshTaskbarEnumProc, 0);
+}
+
 static void ApplyTaskbarMode() {
     DWORD forcedMode = GetForcedTaskbarMode();
 
@@ -454,6 +500,7 @@ static void ApplyTaskbarMode() {
     }
 
     NotifyExplorerSettingsChanged();
+    RefreshTaskbarWindows();
 }
 
 static void RestoreBackupValue(PCWSTR valueName, const BackupValue& backup) {
@@ -560,4 +607,5 @@ void Wh_ModUninit() {
     }
 
     NotifyExplorerSettingsChanged();
+    RefreshTaskbarWindows();
 }
