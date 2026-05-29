@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id taskbar-current-monitor-apps
 // @name Taskbar Current Monitor Apps
-// @description Toggle whether pinned taskbar items are shown on every taskbar, and optionally keep running app buttons scoped to their monitor.
-// @version 1.3
+// @description Show running app buttons only on their monitor, with an experimental option to expose pinned taskbar items on secondary taskbars.
+// @version 1.4
 // @author SUlTlUS + ChatGPT
 // @github https://github.com/SUlTlUS/Taskbar-Current-Monitor-Apps
 // @include explorer.exe
@@ -16,16 +16,17 @@
 
 这个 Windhawk 插件用于 Windows 多显示器任务栏：
 
-- 默认模式：运行中的窗口按钮只显示在窗口所在显示器的任务栏上。
-- 新增开关：`showPinnedOnAllTaskbars`，用于切换固定项是否尽量显示在所有任务栏。
+- 运行中的窗口按钮只显示在窗口所在显示器的任务栏上。
+- `showPinnedOnAllTaskbars` 会尝试让副屏任务栏也按主任务栏方式处理固定项。
 - 默认不持久写入注册表，关闭 mod 后会让 Explorer 重新读取真实设置。
 
 ## 固定项开关说明
 
-Windows 原生的多显示器任务栏设置没有稳定公开的“只让固定项显示在所有任务栏，但运行窗口仍只显示在所在屏幕”的独立开关。因此本 mod 提供两个安全模式：
+`showPinnedOnAllTaskbars` 不是注册表开关。Windows 的 `MMTaskbarMode` 主要控制运行窗口按钮，并不能可靠控制固定项是否显示在副屏任务栏。
 
-- `showPinnedOnAllTaskbars = false`：强制 `MMTaskbarMode = 2`，运行窗口按钮只显示在窗口所在显示器。固定项是否出现在副屏由 Explorer 当前版本决定。
-- `showPinnedOnAllTaskbars = true`：强制 `MMTaskbarMode = 0`，Explorer 原生所有任务栏模式。固定项更容易在所有任务栏显示，但运行窗口按钮也可能被 Windows 一起显示到所有任务栏。
+所以从 v1.4 开始，这个开关会额外 hook `CTaskListWnd::IsOnPrimaryTaskband`，让副屏任务栏在 Explorer 内部尽量被当作“主任务栏”处理。这样更有可能显示固定项，同时仍保持 `MMTaskbarMode = 2` 来让运行窗口按钮只显示在所在屏幕。
+
+这是实验功能，可能随 Windows 版本变化而失效。如果没生效，请重启 `explorer.exe`；如果仍没生效，需要继续针对你当前 Windows 版本的 `taskbar.dll` 做符号适配。
 
 ## 如果旧版本已经把任务栏改乱了
 
@@ -40,7 +41,7 @@ Windows 原生的多显示器任务栏设置没有稳定公开的“只让固定
 /*
 - showPinnedOnAllTaskbars: false
   $name: Show pinned items on all taskbars
-  $description: Uses Windows native all-taskbars mode. This can make pinned items appear on all taskbars, but Windows may also show running app buttons on all taskbars.
+  $description: Experimental. Makes secondary taskbars report themselves as primary taskbars when Explorer checks CTaskListWnd::IsOnPrimaryTaskband. This is intended to expose pinned items on all taskbars while keeping running windows per-monitor.
 - keepEnforced: true
   $name: Keep taskbar mode enforced
   $description: Keep returning the selected taskbar mode when Explorer reads the taskbar registry values.
@@ -53,6 +54,7 @@ Windows 原生的多显示器任务栏设置没有稳定公开的“只让固定
 */
 // ==/WindhawkModSettings==
 
+#include <windhawk_utils.h>
 #include <windows.h>
 
 static constexpr const wchar_t* kExplorerAdvancedKey =
@@ -67,11 +69,9 @@ static constexpr const wchar_t* kValueTaskbarMode = L"MMTaskbarMode";
 //   MMTaskbarMode = 1: show running buttons on the main taskbar and where the window is open.
 //   MMTaskbarMode = 2: show running buttons only where the window is open.
 //
-// Pinned taskbar items are deliberately not enumerated or removed by this mod.
-// The setting below switches between Windows' native taskbar modes instead of
-// rewriting Explorer's internal pinned-item lists.
+// Pinned taskbar items are not controlled reliably by MMTaskbarMode. For pinned
+// items, this mod optionally hooks CTaskListWnd::IsOnPrimaryTaskband.
 static constexpr DWORD kShowTaskbarOnAllDisplays = 1;
-static constexpr DWORD kShowButtonsOnAllTaskbars = 0;
 static constexpr DWORD kShowButtonsOnlyWhereWindowIsOpen = 2;
 
 struct Settings {
@@ -91,6 +91,7 @@ static Settings g_settings;
 static BackupValue g_backupEnabled;
 static BackupValue g_backupMode;
 static bool g_registryWasWritten = false;
+static bool g_taskbarSymbolsHooked = false;
 
 using RegGetValueW_t = LSTATUS(WINAPI*)(
     HKEY hkey,
@@ -109,17 +110,15 @@ using RegQueryValueExW_t = LSTATUS(WINAPI*)(
     LPBYTE lpData,
     LPDWORD lpcbData);
 
+using CTaskListWnd_IsOnPrimaryTaskband_t = int(WINAPI*)(PVOID pThis);
+
 static RegGetValueW_t RegGetValueW_Original;
 static RegQueryValueExW_t RegQueryValueExW_Original;
+static CTaskListWnd_IsOnPrimaryTaskband_t
+    CTaskListWnd_IsOnPrimaryTaskband_Original;
 
 static bool WideEquals(PCWSTR a, PCWSTR b) {
     return a && b && _wcsicmp(a, b) == 0;
-}
-
-static DWORD GetForcedTaskbarMode() {
-    return g_settings.showPinnedOnAllTaskbars
-        ? kShowButtonsOnAllTaskbars
-        : kShowButtonsOnlyWhereWindowIsOpen;
 }
 
 static bool IsForcedValueName(PCWSTR valueName, DWORD* forcedValue) {
@@ -129,11 +128,51 @@ static bool IsForcedValueName(PCWSTR valueName, DWORD* forcedValue) {
     }
 
     if (WideEquals(valueName, kValueTaskbarMode)) {
-        *forcedValue = GetForcedTaskbarMode();
+        *forcedValue = kShowButtonsOnlyWhereWindowIsOpen;
         return true;
     }
 
     return false;
+}
+
+static int WINAPI CTaskListWnd_IsOnPrimaryTaskband_Hook(PVOID pThis) {
+    if (g_settings.showPinnedOnAllTaskbars) {
+        // Experimental: many pinned-item code paths only run for the primary
+        // taskband. Make secondary taskbars pass that check too.
+        return TRUE;
+    }
+
+    return CTaskListWnd_IsOnPrimaryTaskband_Original(pThis);
+}
+
+static bool HookTaskbarSymbols() {
+    HMODULE module = LoadLibraryExW(
+        L"taskbar.dll",
+        nullptr,
+        LOAD_LIBRARY_SEARCH_SYSTEM32);
+
+    if (!module) {
+        Wh_Log(L"Couldn't load taskbar.dll, pinned-item hook unavailable");
+        return false;
+    }
+
+    WindhawkUtils::SYMBOL_HOOK symbolHooks[] = {
+        {
+            {LR"(public: virtual int __cdecl CTaskListWnd::IsOnPrimaryTaskband(void))"},
+            &CTaskListWnd_IsOnPrimaryTaskband_Original,
+            CTaskListWnd_IsOnPrimaryTaskband_Hook,
+            true,
+        },
+    };
+
+    if (!HookSymbols(module, symbolHooks, ARRAYSIZE(symbolHooks))) {
+        Wh_Log(L"HookSymbols for CTaskListWnd::IsOnPrimaryTaskband failed");
+        return false;
+    }
+
+    g_taskbarSymbolsHooked = true;
+    Wh_Log(L"Hooked CTaskListWnd::IsOnPrimaryTaskband for pinned item mode");
+    return true;
 }
 
 static LSTATUS ReturnForcedDword(
@@ -349,8 +388,6 @@ static void NotifyExplorerSettingsChanged() {
 }
 
 static void ApplyTaskbarMode() {
-    const DWORD forcedMode = GetForcedTaskbarMode();
-
     if (g_settings.writeRegistry) {
         bool okEnabled = WriteDwordToAdvancedKey(
             kValueTaskbarEnabled,
@@ -358,22 +395,24 @@ static void ApplyTaskbarMode() {
 
         bool okMode = WriteDwordToAdvancedKey(
             kValueTaskbarMode,
-            forcedMode);
+            kShowButtonsOnlyWhereWindowIsOpen);
 
         g_registryWasWritten = g_registryWasWritten || okEnabled || okMode;
 
         Wh_Log(
-            L"ApplyTaskbarMode: MMTaskbarEnabled=%u (%s), MMTaskbarMode=%u (%s), showPinnedOnAllTaskbars=%d",
+            L"ApplyTaskbarMode: MMTaskbarEnabled=%u (%s), MMTaskbarMode=%u (%s), showPinnedOnAllTaskbars=%d, taskbarSymbolsHooked=%d",
             kShowTaskbarOnAllDisplays,
             okEnabled ? L"ok" : L"failed",
-            forcedMode,
+            kShowButtonsOnlyWhereWindowIsOpen,
             okMode ? L"ok" : L"failed",
-            g_settings.showPinnedOnAllTaskbars);
+            g_settings.showPinnedOnAllTaskbars,
+            g_taskbarSymbolsHooked);
     } else {
         Wh_Log(
-            L"ApplyTaskbarMode: registry write disabled, hook-only mode, MMTaskbarMode=%u, showPinnedOnAllTaskbars=%d",
-            forcedMode,
-            g_settings.showPinnedOnAllTaskbars);
+            L"ApplyTaskbarMode: registry write disabled, hook-only mode, MMTaskbarMode=%u, showPinnedOnAllTaskbars=%d, taskbarSymbolsHooked=%d",
+            kShowButtonsOnlyWhereWindowIsOpen,
+            g_settings.showPinnedOnAllTaskbars,
+            g_taskbarSymbolsHooked);
     }
 
     // Even in hook-only mode, Explorer needs a settings notification so it reads
@@ -415,6 +454,8 @@ BOOL Wh_ModInit() {
 
     ReadDwordFromAdvancedKey(kValueTaskbarEnabled, &g_backupEnabled);
     ReadDwordFromAdvancedKey(kValueTaskbarMode, &g_backupMode);
+
+    HookTaskbarSymbols();
 
     HMODULE advapi32 = GetModuleHandleW(L"advapi32.dll");
     if (!advapi32) {
@@ -471,6 +512,7 @@ void Wh_ModUninit() {
     // Stop returning forced values before notifying Explorer, otherwise Explorer
     // can refresh while the hook still reports the modded values.
     g_settings.keepEnforced = false;
+    g_settings.showPinnedOnAllTaskbars = false;
 
     if (g_settings.restoreOnUnload && g_registryWasWritten) {
         RestoreBackupValue(kValueTaskbarEnabled, g_backupEnabled);
