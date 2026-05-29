@@ -2,12 +2,12 @@
 // @id taskbar-current-monitor-apps
 // @name Taskbar Current Monitor Apps
 // @description Show running app buttons only on their monitor, with an experimental option to expose pinned taskbar items on secondary taskbars.
-// @version 1.4
+// @version 1.4.1
 // @author SUlTlUS + ChatGPT
 // @github https://github.com/SUlTlUS/Taskbar-Current-Monitor-Apps
 // @include explorer.exe
 // @architecture x86-64
-// @compilerOptions -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00 -ladvapi32 -luser32
+// @compilerOptions -DWINVER=0x0A00 -D_WIN32_WINNT=0x0A00 -ladvapi32 -luser32 -lversion
 // ==/WindhawkMod==
 
 // ==WindhawkModReadme==
@@ -26,7 +26,7 @@
 
 所以从 v1.4 开始，这个开关会额外 hook `CTaskListWnd::IsOnPrimaryTaskband`，让副屏任务栏在 Explorer 内部尽量被当作“主任务栏”处理。这样更有可能显示固定项，同时仍保持 `MMTaskbarMode = 2` 来让运行窗口按钮只显示在所在屏幕。
 
-这是实验功能，可能随 Windows 版本变化而失效。如果没生效，请重启 `explorer.exe`；如果仍没生效，需要继续针对你当前 Windows 版本的 `taskbar.dll` 做符号适配。
+这是实验功能，可能随 Windows 版本变化而失效。启用或修改此开关后，请重启 `explorer.exe`，因为副屏任务栏的固定项列表通常不会在运行中完整重建。
 
 ## 如果旧版本已经把任务栏改乱了
 
@@ -41,7 +41,7 @@
 /*
 - showPinnedOnAllTaskbars: false
   $name: Show pinned items on all taskbars
-  $description: Experimental. Makes secondary taskbars report themselves as primary taskbars when Explorer checks CTaskListWnd::IsOnPrimaryTaskband. This is intended to expose pinned items on all taskbars while keeping running windows per-monitor.
+  $description: Experimental. Makes secondary taskbars report themselves as primary taskbars when Explorer checks CTaskListWnd::IsOnPrimaryTaskband. Restart explorer.exe after changing this setting.
 - keepEnforced: true
   $name: Keep taskbar mode enforced
   $description: Keep returning the selected taskbar mode when Explorer reads the taskbar registry values.
@@ -145,14 +145,27 @@ static int WINAPI CTaskListWnd_IsOnPrimaryTaskband_Hook(PVOID pThis) {
     return CTaskListWnd_IsOnPrimaryTaskband_Original(pThis);
 }
 
-static bool HookTaskbarSymbols() {
-    HMODULE module = LoadLibraryExW(
-        L"taskbar.dll",
-        nullptr,
-        LOAD_LIBRARY_SEARCH_SYSTEM32);
-
+static HMODULE GetTaskbarModuleForSymbols() {
+    HMODULE module = GetModuleHandleW(L"taskbar.dll");
     if (!module) {
-        Wh_Log(L"Couldn't load taskbar.dll, pinned-item hook unavailable");
+        module = LoadLibraryExW(
+            L"taskbar.dll",
+            nullptr,
+            LOAD_LIBRARY_SEARCH_SYSTEM32);
+    }
+
+    if (module) {
+        return module;
+    }
+
+    // Windows 10 keeps the old taskbar implementation in explorer.exe.
+    return GetModuleHandleW(nullptr);
+}
+
+static bool HookTaskbarSymbols() {
+    HMODULE module = GetTaskbarModuleForSymbols();
+    if (!module) {
+        Wh_Log(L"Couldn't find taskbar module, pinned-item hook unavailable");
         return false;
     }
 
@@ -161,7 +174,6 @@ static bool HookTaskbarSymbols() {
             {LR"(public: virtual int __cdecl CTaskListWnd::IsOnPrimaryTaskband(void))"},
             &CTaskListWnd_IsOnPrimaryTaskband_Original,
             CTaskListWnd_IsOnPrimaryTaskband_Hook,
-            true,
         },
     };
 
