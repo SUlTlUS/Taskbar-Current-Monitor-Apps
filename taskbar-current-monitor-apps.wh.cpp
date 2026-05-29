@@ -2,7 +2,7 @@
 // @id taskbar-current-monitor-apps
 // @name Taskbar Current Monitor Apps
 // @description Show running app buttons only on their monitor, with an experimental option to expose pinned taskbar items on secondary taskbars.
-// @version 1.4.2
+// @version 1.4.3
 // @author SUlTlUS + ChatGPT
 // @github https://github.com/SUlTlUS/Taskbar-Current-Monitor-Apps
 // @include explorer.exe
@@ -20,6 +20,17 @@
 - `showPinnedOnAllTaskbars` 会尝试让副屏任务栏也按主任务栏方式处理固定项。
 - 默认不持久写入注册表，关闭 mod 后会让 Explorer 重新读取真实设置。
 
+## 重要设置
+
+如果启用 `showPinnedOnAllTaskbars`，v1.4.3 会自动使用安全组合：
+
+```text
+keepEnforced = true
+writeRegistry = false
+```
+
+这样不会再把 `MMTaskbarMode=2` 永久写死到注册表。
+
 ## 固定项开关说明
 
 `showPinnedOnAllTaskbars` 不是注册表开关。Windows 的 `MMTaskbarMode` 主要控制运行窗口按钮，并不能可靠控制固定项是否显示在副屏任务栏。
@@ -30,13 +41,20 @@
 
 ## 调试
 
-v1.4.2 起会同时输出到 Windhawk 日志和 `OutputDebugStringW`。用 DbgViewMini 查看时，请搜索前缀：
+DbgViewMini 里搜索：
 
 ```text
 [TCMA]
 ```
 
-如果完全没有 `[TCMA]`，说明 mod 没有加载进 `explorer.exe`，或者 DbgViewMini 没有捕获当前用户的 Win32 调试输出。
+v1.4.3 会额外记录以下内部函数是否被调用：
+
+- `CTaskListWnd::IsOnPrimaryTaskband`
+- `CTaskListWnd::HandleTaskGroupPinned`
+- `CTaskListWnd::_CreateTBGroup`
+- `CTaskListWnd::_TaskCreated`
+
+如果 `IsOnPrimaryTaskband` 成功 hook 但完全不被调用，说明当前 Windows 版本的副屏固定项不是由这条路径控制，需要继续 hook 更深的任务栏模型或 XAML 数据源。
 
 ## 如果旧版本已经把任务栏改乱了
 
@@ -54,10 +72,10 @@ v1.4.2 起会同时输出到 Windhawk 日志和 `OutputDebugStringW`。用 DbgVi
   $description: Experimental. Makes secondary taskbars report themselves as primary taskbars when Explorer checks CTaskListWnd::IsOnPrimaryTaskband. Restart explorer.exe after changing this setting.
 - keepEnforced: true
   $name: Keep taskbar mode enforced
-  $description: Keep returning the selected taskbar mode when Explorer reads the taskbar registry values.
+  $description: Keep returning the selected taskbar mode when Explorer reads the taskbar registry values. Forced on when Show pinned items on all taskbars is enabled.
 - writeRegistry: false
   $name: Also write registry values
-  $description: Optional legacy mode. Writes Explorer taskbar settings to the registry while enabled. Keep this off if you want disabling the mod to restore automatically.
+  $description: Optional legacy mode. Forced off when Show pinned items on all taskbars is enabled, to avoid permanently writing MMTaskbarMode=2.
 - restoreOnUnload: true
   $name: Restore registry values on unload if registry was written
   $description: Only used when writeRegistry is enabled. Restores the registry values captured when the mod was loaded.
@@ -89,14 +107,6 @@ static constexpr const wchar_t* kExplorerAdvancedKey =
 static constexpr const wchar_t* kValueTaskbarEnabled = L"MMTaskbarEnabled";
 static constexpr const wchar_t* kValueTaskbarMode = L"MMTaskbarMode";
 
-// Windows multi-monitor taskbar mode:
-//   MMTaskbarEnabled = 1: show taskbar on all displays.
-//   MMTaskbarMode = 0: show running taskbar buttons on all taskbars.
-//   MMTaskbarMode = 1: show running buttons on the main taskbar and where the window is open.
-//   MMTaskbarMode = 2: show running buttons only where the window is open.
-//
-// Pinned taskbar items are not controlled reliably by MMTaskbarMode. For pinned
-// items, this mod optionally hooks CTaskListWnd::IsOnPrimaryTaskband.
 static constexpr DWORD kShowTaskbarOnAllDisplays = 1;
 static constexpr DWORD kShowButtonsOnlyWhereWindowIsOpen = 2;
 
@@ -137,11 +147,16 @@ using RegQueryValueExW_t = LSTATUS(WINAPI*)(
     LPDWORD lpcbData);
 
 using CTaskListWnd_IsOnPrimaryTaskband_t = int(WINAPI*)(PVOID pThis);
+using CTaskListWnd_HandleTaskGroupPinned_t = void(WINAPI*)(PVOID pThis, PVOID taskGroup);
+using CTaskListWnd__CreateTBGroup_t = PVOID(WINAPI*)(PVOID pThis, PVOID taskGroup, int index);
+using CTaskListWnd__TaskCreated_t = LONG_PTR(WINAPI*)(PVOID pThis, PVOID taskGroup, PVOID taskItem, int param3);
 
 static RegGetValueW_t RegGetValueW_Original;
 static RegQueryValueExW_t RegQueryValueExW_Original;
-static CTaskListWnd_IsOnPrimaryTaskband_t
-    CTaskListWnd_IsOnPrimaryTaskband_Original;
+static CTaskListWnd_IsOnPrimaryTaskband_t CTaskListWnd_IsOnPrimaryTaskband_Original;
+static CTaskListWnd_HandleTaskGroupPinned_t CTaskListWnd_HandleTaskGroupPinned_Original;
+static CTaskListWnd__CreateTBGroup_t CTaskListWnd__CreateTBGroup_Original;
+static CTaskListWnd__TaskCreated_t CTaskListWnd__TaskCreated_Original;
 
 static bool WideEquals(PCWSTR a, PCWSTR b) {
     return a && b && _wcsicmp(a, b) == 0;
@@ -165,22 +180,49 @@ static int WINAPI CTaskListWnd_IsOnPrimaryTaskband_Hook(PVOID pThis) {
     static int logCount = 0;
 
     if (g_settings.showPinnedOnAllTaskbars) {
-        if (logCount < 20) {
+        if (logCount < 100) {
             DebugLog(L"IsOnPrimaryTaskband hook called, forced TRUE, this=%p", pThis);
             logCount++;
         }
-
-        // Experimental: many pinned-item code paths only run for the primary
-        // taskband. Make secondary taskbars pass that check too.
         return TRUE;
     }
 
-    if (logCount < 3) {
+    if (logCount < 10) {
         DebugLog(L"IsOnPrimaryTaskband hook called, passthrough, this=%p", pThis);
         logCount++;
     }
 
     return CTaskListWnd_IsOnPrimaryTaskband_Original(pThis);
+}
+
+static void WINAPI CTaskListWnd_HandleTaskGroupPinned_Hook(PVOID pThis, PVOID taskGroup) {
+    static int logCount = 0;
+    if (logCount < 100) {
+        DebugLog(L"HandleTaskGroupPinned called, this=%p, taskGroup=%p", pThis, taskGroup);
+        logCount++;
+    }
+
+    CTaskListWnd_HandleTaskGroupPinned_Original(pThis, taskGroup);
+}
+
+static PVOID WINAPI CTaskListWnd__CreateTBGroup_Hook(PVOID pThis, PVOID taskGroup, int index) {
+    static int logCount = 0;
+    if (logCount < 120) {
+        DebugLog(L"_CreateTBGroup called, this=%p, taskGroup=%p, index=%d", pThis, taskGroup, index);
+        logCount++;
+    }
+
+    return CTaskListWnd__CreateTBGroup_Original(pThis, taskGroup, index);
+}
+
+static LONG_PTR WINAPI CTaskListWnd__TaskCreated_Hook(PVOID pThis, PVOID taskGroup, PVOID taskItem, int param3) {
+    static int logCount = 0;
+    if (logCount < 120) {
+        DebugLog(L"_TaskCreated called, this=%p, taskGroup=%p, taskItem=%p, param3=%d", pThis, taskGroup, taskItem, param3);
+        logCount++;
+    }
+
+    return CTaskListWnd__TaskCreated_Original(pThis, taskGroup, taskItem, param3);
 }
 
 static HMODULE GetTaskbarModuleForSymbols() {
@@ -190,11 +232,7 @@ static HMODULE GetTaskbarModuleForSymbols() {
         return module;
     }
 
-    module = LoadLibraryExW(
-        L"taskbar.dll",
-        nullptr,
-        LOAD_LIBRARY_SEARCH_SYSTEM32);
-
+    module = LoadLibraryExW(L"taskbar.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (module) {
         DebugLog(L"taskbar.dll loaded by mod: %p", module);
         return module;
@@ -218,15 +256,33 @@ static bool HookTaskbarSymbols() {
             &CTaskListWnd_IsOnPrimaryTaskband_Original,
             CTaskListWnd_IsOnPrimaryTaskband_Hook,
         },
+        {
+            {LR"(public: virtual void __cdecl CTaskListWnd::HandleTaskGroupPinned(struct ITaskGroup *))"},
+            &CTaskListWnd_HandleTaskGroupPinned_Original,
+            CTaskListWnd_HandleTaskGroupPinned_Hook,
+            true,
+        },
+        {
+            {LR"(protected: struct ITaskBtnGroup * __cdecl CTaskListWnd::_CreateTBGroup(struct ITaskGroup *,int))"},
+            &CTaskListWnd__CreateTBGroup_Original,
+            CTaskListWnd__CreateTBGroup_Hook,
+            true,
+        },
+        {
+            {LR"(protected: long __cdecl CTaskListWnd::_TaskCreated(struct ITaskGroup *,struct ITaskItem *,int))"},
+            &CTaskListWnd__TaskCreated_Original,
+            CTaskListWnd__TaskCreated_Hook,
+            true,
+        },
     };
 
     if (!HookSymbols(module, symbolHooks, ARRAYSIZE(symbolHooks))) {
-        DebugLog(L"HookSymbols for CTaskListWnd::IsOnPrimaryTaskband failed");
+        DebugLog(L"HookSymbols for taskbar internals failed");
         return false;
     }
 
     g_taskbarSymbolsHooked = true;
-    DebugLog(L"Hooked CTaskListWnd::IsOnPrimaryTaskband for pinned item mode");
+    DebugLog(L"Hooked taskbar internals for pinned item diagnostics");
     return true;
 }
 
@@ -280,23 +336,11 @@ static LSTATUS WINAPI RegGetValueW_Hook(
     if (g_settings.keepEnforced) {
         DWORD forcedValue = 0;
         if (IsForcedValueName(lpValue, &forcedValue)) {
-            return ReturnForcedDword(
-                forcedValue,
-                dwFlags,
-                pdwType,
-                pvData,
-                pcbData);
+            return ReturnForcedDword(forcedValue, dwFlags, pdwType, pvData, pcbData);
         }
     }
 
-    return RegGetValueW_Original(
-        hkey,
-        lpSubKey,
-        lpValue,
-        dwFlags,
-        pdwType,
-        pvData,
-        pcbData);
+    return RegGetValueW_Original(hkey, lpSubKey, lpValue, dwFlags, pdwType, pvData, pcbData);
 }
 
 static LSTATUS WINAPI RegQueryValueExW_Hook(
@@ -309,35 +353,18 @@ static LSTATUS WINAPI RegQueryValueExW_Hook(
     if (g_settings.keepEnforced) {
         DWORD forcedValue = 0;
         if (IsForcedValueName(lpValueName, &forcedValue)) {
-            return ReturnForcedDword(
-                forcedValue,
-                0,
-                lpType,
-                lpData,
-                lpcbData);
+            return ReturnForcedDword(forcedValue, 0, lpType, lpData, lpcbData);
         }
     }
 
-    return RegQueryValueExW_Original(
-        hKey,
-        lpValueName,
-        lpReserved,
-        lpType,
-        lpData,
-        lpcbData);
+    return RegQueryValueExW_Original(hKey, lpValueName, lpReserved, lpType, lpData, lpcbData);
 }
 
 static bool ReadDwordFromAdvancedKey(PCWSTR valueName, BackupValue* backup) {
     backup->captured = true;
 
     HKEY key = nullptr;
-    LSTATUS status = RegOpenKeyExW(
-        HKEY_CURRENT_USER,
-        kExplorerAdvancedKey,
-        0,
-        KEY_QUERY_VALUE,
-        &key);
-
+    LSTATUS status = RegOpenKeyExW(HKEY_CURRENT_USER, kExplorerAdvancedKey, 0, KEY_QUERY_VALUE, &key);
     if (status != ERROR_SUCCESS) {
         backup->existed = false;
         return false;
@@ -347,14 +374,7 @@ static bool ReadDwordFromAdvancedKey(PCWSTR valueName, BackupValue* backup) {
     DWORD value = 0;
     DWORD size = sizeof(value);
 
-    status = RegQueryValueExW(
-        key,
-        valueName,
-        nullptr,
-        &type,
-        reinterpret_cast<LPBYTE>(&value),
-        &size);
-
+    status = RegQueryValueExW(key, valueName, nullptr, &type, reinterpret_cast<LPBYTE>(&value), &size);
     RegCloseKey(key);
 
     if (status == ERROR_SUCCESS && type == REG_DWORD && size == sizeof(DWORD)) {
@@ -371,30 +391,13 @@ static bool WriteDwordToAdvancedKey(PCWSTR valueName, DWORD value) {
     HKEY key = nullptr;
     DWORD disposition = 0;
 
-    LSTATUS status = RegCreateKeyExW(
-        HKEY_CURRENT_USER,
-        kExplorerAdvancedKey,
-        0,
-        nullptr,
-        REG_OPTION_NON_VOLATILE,
-        KEY_SET_VALUE,
-        nullptr,
-        &key,
-        &disposition);
-
+    LSTATUS status = RegCreateKeyExW(HKEY_CURRENT_USER, kExplorerAdvancedKey, 0, nullptr, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, nullptr, &key, &disposition);
     if (status != ERROR_SUCCESS) {
         DebugLog(L"RegCreateKeyExW failed: %ld", status);
         return false;
     }
 
-    status = RegSetValueExW(
-        key,
-        valueName,
-        0,
-        REG_DWORD,
-        reinterpret_cast<const BYTE*>(&value),
-        sizeof(value));
-
+    status = RegSetValueExW(key, valueName, 0, REG_DWORD, reinterpret_cast<const BYTE*>(&value), sizeof(value));
     RegCloseKey(key);
 
     if (status != ERROR_SUCCESS) {
@@ -407,13 +410,7 @@ static bool WriteDwordToAdvancedKey(PCWSTR valueName, DWORD value) {
 
 static void DeleteAdvancedValue(PCWSTR valueName) {
     HKEY key = nullptr;
-    LSTATUS status = RegOpenKeyExW(
-        HKEY_CURRENT_USER,
-        kExplorerAdvancedKey,
-        0,
-        KEY_SET_VALUE,
-        &key);
-
+    LSTATUS status = RegOpenKeyExW(HKEY_CURRENT_USER, kExplorerAdvancedKey, 0, KEY_SET_VALUE, &key);
     if (status == ERROR_SUCCESS) {
         RegDeleteValueW(key, valueName);
         RegCloseKey(key);
@@ -422,36 +419,14 @@ static void DeleteAdvancedValue(PCWSTR valueName) {
 
 static void NotifyExplorerSettingsChanged() {
     DWORD_PTR result = 0;
-
-    SendMessageTimeoutW(
-        HWND_BROADCAST,
-        WM_SETTINGCHANGE,
-        0,
-        reinterpret_cast<LPARAM>(L"TraySettings"),
-        SMTO_ABORTIFHUNG | SMTO_NORMAL,
-        2000,
-        &result);
-
-    SendMessageTimeoutW(
-        HWND_BROADCAST,
-        WM_SETTINGCHANGE,
-        0,
-        reinterpret_cast<LPARAM>(L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"),
-        SMTO_ABORTIFHUNG | SMTO_NORMAL,
-        2000,
-        &result);
+    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(L"TraySettings"), SMTO_ABORTIFHUNG | SMTO_NORMAL, 2000, &result);
+    SendMessageTimeoutW(HWND_BROADCAST, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(L"Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Advanced"), SMTO_ABORTIFHUNG | SMTO_NORMAL, 2000, &result);
 }
 
 static void ApplyTaskbarMode() {
     if (g_settings.writeRegistry) {
-        bool okEnabled = WriteDwordToAdvancedKey(
-            kValueTaskbarEnabled,
-            kShowTaskbarOnAllDisplays);
-
-        bool okMode = WriteDwordToAdvancedKey(
-            kValueTaskbarMode,
-            kShowButtonsOnlyWhereWindowIsOpen);
-
+        bool okEnabled = WriteDwordToAdvancedKey(kValueTaskbarEnabled, kShowTaskbarOnAllDisplays);
+        bool okMode = WriteDwordToAdvancedKey(kValueTaskbarMode, kShowButtonsOnlyWhereWindowIsOpen);
         g_registryWasWritten = g_registryWasWritten || okEnabled || okMode;
 
         DebugLog(
@@ -470,8 +445,6 @@ static void ApplyTaskbarMode() {
             g_taskbarSymbolsHooked);
     }
 
-    // Even in hook-only mode, Explorer needs a settings notification so it reads
-    // the values again while this mod's registry hook is active.
     NotifyExplorerSettingsChanged();
 }
 
@@ -488,11 +461,18 @@ static void RestoreBackupValue(PCWSTR valueName, const BackupValue& backup) {
 }
 
 static void LoadSettings() {
-    g_settings.showPinnedOnAllTaskbars =
-        Wh_GetIntSetting(L"showPinnedOnAllTaskbars") != 0;
+    g_settings.showPinnedOnAllTaskbars = Wh_GetIntSetting(L"showPinnedOnAllTaskbars") != 0;
     g_settings.keepEnforced = Wh_GetIntSetting(L"keepEnforced") != 0;
     g_settings.writeRegistry = Wh_GetIntSetting(L"writeRegistry") != 0;
     g_settings.restoreOnUnload = Wh_GetIntSetting(L"restoreOnUnload") != 0;
+
+    if (g_settings.showPinnedOnAllTaskbars) {
+        if (!g_settings.keepEnforced || g_settings.writeRegistry) {
+            DebugLog(L"showPinnedOnAllTaskbars enabled: forcing keepEnforced=1 and writeRegistry=0 for safe experimental mode");
+        }
+        g_settings.keepEnforced = true;
+        g_settings.writeRegistry = false;
+    }
 
     DebugLog(
         L"Settings: showPinnedOnAllTaskbars=%d, keepEnforced=%d, writeRegistry=%d, restoreOnUnload=%d",
@@ -529,28 +509,20 @@ BOOL Wh_ModInit() {
         return FALSE;
     }
 
-    void* regGetValue = reinterpret_cast<void*>(
-        GetProcAddress(advapi32, "RegGetValueW"));
-    void* regQueryValueEx = reinterpret_cast<void*>(
-        GetProcAddress(advapi32, "RegQueryValueExW"));
+    void* regGetValue = reinterpret_cast<void*>(GetProcAddress(advapi32, "RegGetValueW"));
+    void* regQueryValueEx = reinterpret_cast<void*>(GetProcAddress(advapi32, "RegQueryValueExW"));
 
     if (!regGetValue || !regQueryValueEx) {
         DebugLog(L"Couldn't find registry APIs");
         return FALSE;
     }
 
-    if (!Wh_SetFunctionHook(
-            regGetValue,
-            reinterpret_cast<void*>(RegGetValueW_Hook),
-            reinterpret_cast<void**>(&RegGetValueW_Original))) {
+    if (!Wh_SetFunctionHook(regGetValue, reinterpret_cast<void*>(RegGetValueW_Hook), reinterpret_cast<void**>(&RegGetValueW_Original))) {
         DebugLog(L"Wh_SetFunctionHook(RegGetValueW) failed");
         return FALSE;
     }
 
-    if (!Wh_SetFunctionHook(
-            regQueryValueEx,
-            reinterpret_cast<void*>(RegQueryValueExW_Hook),
-            reinterpret_cast<void**>(&RegQueryValueExW_Original))) {
+    if (!Wh_SetFunctionHook(regQueryValueEx, reinterpret_cast<void*>(RegQueryValueExW_Hook), reinterpret_cast<void**>(&RegQueryValueExW_Original))) {
         DebugLog(L"Wh_SetFunctionHook(RegQueryValueExW) failed");
         return FALSE;
     }
@@ -573,8 +545,6 @@ void Wh_ModSettingsChanged() {
 void Wh_ModUninit() {
     DebugLog(L"Wh_ModUninit");
 
-    // Stop returning forced values before notifying Explorer, otherwise Explorer
-    // can refresh while the hook still reports the modded values.
     g_settings.keepEnforced = false;
     g_settings.showPinnedOnAllTaskbars = false;
 
@@ -583,7 +553,5 @@ void Wh_ModUninit() {
         RestoreBackupValue(kValueTaskbarMode, g_backupMode);
     }
 
-    // Always notify Explorer on unload. In the default hook-only mode this is the
-    // actual restore path: Explorer will read the real registry values again.
     NotifyExplorerSettingsChanged();
 }
