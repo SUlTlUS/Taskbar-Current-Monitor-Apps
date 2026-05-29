@@ -2,7 +2,7 @@
 // @id taskbar-current-monitor-apps
 // @name Taskbar Current Monitor Apps
 // @description Show running app buttons only on their monitor, with diagnostics for pinned buttons on secondary taskbars.
-// @version 1.5
+// @version 1.5.1
 // @author SUlTlUS + ChatGPT
 // @github https://github.com/SUlTlUS/Taskbar-Current-Monitor-Apps
 // @include explorer.exe
@@ -14,9 +14,8 @@
 /*
 # Taskbar Current Monitor Apps
 
-v1.5 keeps the old task list diagnostics and adds Windows 11 XAML taskbar diagnostics.
-If the old task list has pinned buttons but the secondary taskbar still doesn't show them,
-DbgViewMini should now show whether `Taskbar.TaskListButton` exists in the UI layer.
+v1.5.1 fixes Windhawk/Clang compilation by removing MSVC-only `__try / __except`.
+It keeps the old task list diagnostics and Windows 11 XAML taskbar diagnostics.
 
 Search logs for `[TCMA]` and especially:
 
@@ -147,12 +146,9 @@ static LONG_PTR WINAPI CTaskListWnd__TaskCreated_Hook(PVOID pThis,PVOID taskGrou
 static void WINAPI TaskListButton_DisplayName_Hook(void* pThis,winrt::hstring name){
     TaskListButton_DisplayName_Original(pThis,name);
     static int n=0;
-    if(n<300){
-        DebugLog(L"TaskListButton DisplayName: this=%p, name=%s",pThis,name.c_str());
-        n++;
-    }
+    if(n<300){DebugLog(L"TaskListButton DisplayName: this=%p, name=%s",pThis,name.c_str());n++;}
     if(g_settings.showPinnedOnAllTaskbars){
-        __try{
+        try{
             void* unkPtr=(void**)pThis+3;
             winrt::Windows::Foundation::IUnknown unk;
             winrt::copy_from_abi(unk,unkPtr);
@@ -162,7 +158,7 @@ static void WINAPI TaskListButton_DisplayName_Hook(void* pThis,winrt::hstring na
                 element.Opacity(1.0);
                 static int v=0;if(v<200){DebugLog(L"Made TaskListButton visible: this=%p, name=%s",pThis,name.c_str());v++;}
             }
-        }__except(EXCEPTION_EXECUTE_HANDLER){
+        }catch(...){
             static int e=0;if(e<20){DebugLog(L"TaskListButton visibility tweak exception: this=%p",pThis);e++;}
         }
     }
