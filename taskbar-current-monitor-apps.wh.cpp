@@ -1,8 +1,8 @@
 // ==WindhawkMod==
 // @id taskbar-current-monitor-apps
 // @name Taskbar Current Monitor Apps
-// @description Make running taskbar buttons appear only on the monitor where the window is open. Pinned taskbar items are not modified.
-// @version 2.0
+// @description 多显示器任务栏：运行窗口按钮只显示在窗口所在显示器，固定项不做修改。
+// @version 2.0.1
 // @author SUlTlUS + ChatGPT
 // @github https://github.com/SUlTlUS/Taskbar-Current-Monitor-Apps
 // @include explorer.exe
@@ -44,9 +44,9 @@ MMTaskbarMode    = 2
 保持默认设置即可：
 
 ```text
-keepEnforced = true
-writeRegistry = false
-restoreOnUnload = true
+持续强制任务栏模式 = 开启
+同时写入注册表 = 关闭
+卸载时恢复注册表 = 开启
 ```
 
 如果之前旧版本把任务栏状态改乱，先关闭 mod，然后运行仓库里的恢复脚本：
@@ -59,17 +59,17 @@ restoreOnUnload = true
 // ==WindhawkModSettings==
 /*
 - keepEnforced: true
-  $name: Keep taskbar mode enforced
-  $description: Keep returning the per-monitor taskbar mode when Explorer reads the taskbar registry values.
+  $name: 持续强制任务栏模式
+  $description: Explorer 读取任务栏设置时，持续返回“运行窗口只显示在所在显示器”的模式。建议保持开启。
 - writeRegistry: false
-  $name: Also write registry values
-  $description: Optional. Writes Explorer taskbar settings to the registry while enabled. Keep this off if you want disabling the mod to restore automatically.
+  $name: 同时写入注册表
+  $description: 可选。启用后会把任务栏模式写入当前用户注册表。建议保持关闭，这样停用 mod 后更容易自动恢复。
 - restoreOnUnload: true
-  $name: Restore registry values on unload if registry was written
-  $description: Only used when writeRegistry is enabled. Restores registry values captured when the mod was loaded.
+  $name: 卸载时恢复注册表
+  $description: 仅在“同时写入注册表”开启时生效。关闭或卸载 mod 时，恢复加载 mod 前记录的注册表值。
 - debugOutput: false
-  $name: Enable debug output
-  $description: Print [TCMA] diagnostic lines to Windhawk logs and OutputDebugString.
+  $name: 启用调试输出
+  $description: 在 Windhawk 日志和 OutputDebugString 中输出 [TCMA] 调试信息。一般用户不需要开启。
 */
 // ==/WindhawkModSettings==
 
@@ -208,7 +208,7 @@ static LSTATUS WINAPI RegGetValueW_Hook(
     if (g_settings.keepEnforced) {
         DWORD forcedValue = 0;
         if (IsForcedValueName(lpValue, &forcedValue)) {
-            DebugLog(L"Forced RegGetValueW: %s=%u", lpValue, forcedValue);
+            DebugLog(L"强制 RegGetValueW: %s=%u", lpValue, forcedValue);
             return ReturnForcedDword(forcedValue, dwFlags, pdwType, pvData, pcbData);
         }
     }
@@ -233,7 +233,7 @@ static LSTATUS WINAPI RegQueryValueExW_Hook(
     if (g_settings.keepEnforced) {
         DWORD forcedValue = 0;
         if (IsForcedValueName(lpValueName, &forcedValue)) {
-            DebugLog(L"Forced RegQueryValueExW: %s=%u", lpValueName, forcedValue);
+            DebugLog(L"强制 RegQueryValueExW: %s=%u", lpValueName, forcedValue);
             return ReturnForcedDword(forcedValue, 0, lpType, lpData, lpcbData);
         }
     }
@@ -302,7 +302,7 @@ static bool WriteDwordToAdvancedKey(PCWSTR valueName, DWORD value) {
         &disposition);
 
     if (status != ERROR_SUCCESS) {
-        DebugLog(L"RegCreateKeyExW failed: %ld", status);
+        DebugLog(L"RegCreateKeyExW 失败: %ld", status);
         return false;
     }
 
@@ -317,7 +317,7 @@ static bool WriteDwordToAdvancedKey(PCWSTR valueName, DWORD value) {
     RegCloseKey(key);
 
     if (status != ERROR_SUCCESS) {
-        DebugLog(L"RegSetValueExW(%s) failed: %ld", valueName, status);
+        DebugLog(L"RegSetValueExW(%s) 失败: %ld", valueName, status);
         return false;
     }
 
@@ -375,7 +375,7 @@ static BOOL CALLBACK RefreshTaskbarEnumProc(HWND hwnd, LPARAM) {
 
     if (_wcsicmp(className, L"Shell_TrayWnd") == 0 ||
         _wcsicmp(className, L"Shell_SecondaryTrayWnd") == 0) {
-        DebugLog(L"RefreshTaskbar: %s hwnd=%p", className, hwnd);
+        DebugLog(L"刷新任务栏: %s hwnd=%p", className, hwnd);
         SendMessageW(hwnd, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(L"TraySettings"));
         PostMessageW(hwnd, WM_SETTINGCHANGE, 0, reinterpret_cast<LPARAM>(L"TraySettings"));
     }
@@ -401,11 +401,11 @@ static void ApplyTaskbarMode() {
         g_registryWasWritten = g_registryWasWritten || okEnabled || okMode;
 
         DebugLog(
-            L"ApplyTaskbarMode registry: enabled=%s mode=%s",
-            okEnabled ? L"ok" : L"fail",
-            okMode ? L"ok" : L"fail");
+            L"应用任务栏模式到注册表: enabled=%s mode=%s",
+            okEnabled ? L"成功" : L"失败",
+            okMode ? L"成功" : L"失败");
     } else {
-        DebugLog(L"ApplyTaskbarMode hook-only: mode=2");
+        DebugLog(L"应用任务栏模式: 仅运行时 hook，mode=2");
     }
 
     NotifyExplorerSettingsChanged();
@@ -431,7 +431,7 @@ static void LoadSettings() {
     g_settings.debugOutput = Wh_GetIntSetting(L"debugOutput") != 0;
 
     DebugLog(
-        L"Settings: keep=%d write=%d restore=%d debug=%d",
+        L"设置: keep=%d write=%d restore=%d debug=%d",
         g_settings.keepEnforced,
         g_settings.writeRegistry,
         g_settings.restoreOnUnload,
@@ -451,7 +451,7 @@ BOOL Wh_ModInit() {
     }
 
     if (!advapi32) {
-        DebugLog(L"No advapi32");
+        DebugLog(L"找不到 advapi32.dll");
         return FALSE;
     }
 
@@ -459,7 +459,7 @@ BOOL Wh_ModInit() {
     void* regQueryValueEx = reinterpret_cast<void*>(GetProcAddress(advapi32, "RegQueryValueExW"));
 
     if (!regGetValue || !regQueryValueEx) {
-        DebugLog(L"No registry APIs");
+        DebugLog(L"找不到注册表 API");
         return FALSE;
     }
 
@@ -467,7 +467,7 @@ BOOL Wh_ModInit() {
             regGetValue,
             reinterpret_cast<void*>(RegGetValueW_Hook),
             reinterpret_cast<void**>(&RegGetValueW_Original))) {
-        DebugLog(L"RegGetValueW hook failed");
+        DebugLog(L"RegGetValueW hook 失败");
         return FALSE;
     }
 
@@ -475,7 +475,7 @@ BOOL Wh_ModInit() {
             regQueryValueEx,
             reinterpret_cast<void*>(RegQueryValueExW_Hook),
             reinterpret_cast<void**>(&RegQueryValueExW_Original))) {
-        DebugLog(L"RegQueryValueExW hook failed");
+        DebugLog(L"RegQueryValueExW hook 失败");
         return FALSE;
     }
 
